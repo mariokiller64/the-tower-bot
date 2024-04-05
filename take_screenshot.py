@@ -13,24 +13,8 @@ if cap is None:
 # Save image
 image_filename = 'screenshot'
 image_suffix = ".png"
-script_dir = r"D:\Git_Projects\Gaminig\TheTower\bjyxm_bot\screenshots"
-image_path = os.path.join(script_dir, image_filename + image_suffix)
+script_dir = os.path.dirname(os.path.realpath(__file__))
+image_path = os.path.join(script_dir, "screenshots", image_filename + image_suffix)
 print(image_path)
 
 cap.save(image_path)
-
-def draw_rectangles(image_path, rect):
-    # Open the image
-    img = Image.open(image_path)
-    draw = ImageDraw.Draw(img)
-
-    # Draw rectangle
-    draw.rectangle(rect, outline="red")
-
-    # Display the image
-    img.show()
-
-#rect = (10, 780, 40, 40)
-#draw_rectangles(image_path, rect)
-
-#capture.crop((10, 780, 150, 820)).show()

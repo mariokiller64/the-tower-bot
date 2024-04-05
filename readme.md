@@ -2,7 +2,7 @@
 
 ## Environment
 - Python 3.12.1
-- BlueStacks 5 (Portrait / 720x1280 / 240 DPI / recommend to disable Hyper-V so ADB ports aren't screwed up)
+- BlueStacks 5.13.220.1002 (Portrait / 720x1280 / 240 DPI / recommend to disable Hyper-V so ADB ports aren't screwed up)
 - Android Debug Bridge (from platform-tools_r32.0.0-windows)
 
 ## Python packages
@@ -15,7 +15,7 @@
 
 ## Prerequisites
 - Set up python environment
-- Install BlueStacks 5 and set display settings to 'portrait', '720x1280'
+- Install BlueStacks 5.13.220.1002 and set display settings to 'portrait', '720x1280', and Pixel density to '240 DPI (Medium)'
 
 # Setup ADB
 - There are two ways of running adb on Windows.
