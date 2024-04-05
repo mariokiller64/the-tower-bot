@@ -1,13 +1,13 @@
 # The Tower Automation
 
 ## Environment
-- Python 3.10
-- BlueStacks 5 (Portrait / 720x1280)
+- Python 3.12.1
+- BlueStacks 5 (Portrait / 720x1280 / 240 DPI / recommend to disable Hyper-V so ADB ports aren't screwed up)
 - Android Debug Bridge (from platform-tools_r32.0.0-windows)
 
 ## Python packages
 - pure-python-adb 0.3.0.dev0
-- Pillow 9.0.1
+- Pillow 10.2.0
 
 ## ADB ?
 - All python automation scripts in this project use Android Debug Bridge(ADB) which is officially provided by Google.
