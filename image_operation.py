@@ -1,9 +1,12 @@
-# image_operation.py - Complete rewrite with advanced computer vision
+# image_operation.py - Enhanced with OCR for gem farming
 import cv2
 import numpy as np
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
 from dataclasses import dataclass
 import logging
+from pathlib import Path
+import pytesseract
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,33 @@ class ImageMatcher:
     def __init__(self):
         self.feature_detector = cv2.SIFT_create()
         self.matcher = cv2.BFMatcher()
+        self.template_cache = {}
+        self._load_templates()
+        
+    def _load_templates(self):
+        """Load all button templates"""
+        template_dir = Path("templates")
+        if not template_dir.exists():
+            template_dir.mkdir(exist_ok=True)
+            logger.warning("Templates directory created. Add button templates!")
+            return
+            
+        # Load button templates
+        button_names = [
+            "5_gem_ad", "claim", "close", "x_button",
+            "spinning_gem", "start_wave", "retry",
+            "workshop", "lab", "cards", "modules"
+        ]
+        
+        for name in button_names:
+            for ext in [".png", ".jpg"]:
+                path = template_dir / f"{name}{ext}"
+                if path.exists():
+                    template = cv2.imread(str(path))
+                    if template is not None:
+                        self.template_cache[name] = template
+                        logger.debug(f"Loaded template: {name}")
+                    break
         
     def template_match(self, image: np.ndarray, template: np.ndarray, 
                       threshold: float = 0.8) -> Optional[MatchResult]:
@@ -52,9 +82,14 @@ class ImageMatcher:
             
             if max_val > best_val and max_val >= threshold:
                 best_val = max_val
+                # Calculate center position
+                h, w = scaled_template.shape[:2]
+                center_x = max_loc[0] + w // 2
+                center_y = max_loc[1] + h // 2
+                
                 best_match = MatchResult(
                     confidence=max_val,
-                    location=max_loc,
+                    location=(center_x, center_y),
                     scale=scale,
                     method="template"
                 )
@@ -99,147 +134,367 @@ class ImageMatcher:
             
         return None
     
-    def histogram_match(self, region1: np.ndarray, region2: np.ndarray,
-                       method: int = cv2.HISTCMP_CORREL) -> float:
-        """Enhanced histogram comparison"""
-        # Calculate histograms for each channel
-        hist1_b = cv2.calcHist([region1], [0], None, [256], [0, 256])
-        hist1_g = cv2.calcHist([region1], [1], None, [256], [0, 256])
-        hist1_r = cv2.calcHist([region1], [2], None, [256], [0, 256])
+    def detect_ad_button(self, screen: np.ndarray) -> Optional[Tuple[int, int]]:
+        """Specialized detection for 5-gem ad button"""
+        # Multiple detection strategies for ad button
         
-        hist2_b = cv2.calcHist([region2], [0], None, [256], [0, 256])
-        hist2_g = cv2.calcHist([region2], [1], None, [256], [0, 256])
-        hist2_r = cv2.calcHist([region2], [2], None, [256], [0, 256])
+        # Strategy 1: Template matching
+        if "5_gem_ad" in self.template_cache:
+            result = self.template_match(screen, self.template_cache["5_gem_ad"], threshold=0.7)
+            if result:
+                return result.location
         
-        # Normalize histograms
-        cv2.normalize(hist1_b, hist1_b)
-        cv2.normalize(hist1_g, hist1_g)
-        cv2.normalize(hist1_r, hist1_r)
-        cv2.normalize(hist2_b, hist2_b)
-        cv2.normalize(hist2_g, hist2_g)
-        cv2.normalize(hist2_r, hist2_r)
+        # Strategy 2: Color-based detection for gem icon
+        # Ad button typically has bright gem colors
+        hsv = cv2.cvtColor(screen, cv2.COLOR_BGR2HSV)
         
-        # Compare histograms
-        score_b = cv2.compareHist(hist1_b, hist2_b, method)
-        score_g = cv2.compareHist(hist1_g, hist2_g, method)
-        score_r = cv2.compareHist(hist1_r, hist2_r, method)
+        # Define color ranges for gems (cyan/blue)
+        lower_gem = np.array([80, 100, 100])
+        upper_gem = np.array([100, 255, 255])
         
-        # Weighted average (green is most important for human perception)
-        return 0.3 * score_b + 0.4 * score_g + 0.3 * score_r
+        # Create mask for gem colors
+        gem_mask = cv2.inRange(hsv, lower_gem, upper_gem)
+        
+        # Focus on bottom 40% of screen where ad button appears
+        h, w = screen.shape[:2]
+        roi_mask = np.zeros_like(gem_mask)
+        roi_mask[int(h*0.6):, int(w*0.2):int(w*0.8)] = 255
+        
+        # Combine masks
+        combined_mask = cv2.bitwise_and(gem_mask, roi_mask)
+        
+        # Find contours
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Look for button-sized contours
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if 5000 < area < 20000:  # Button size range
+                x, y, w, h = cv2.boundingRect(contour)
+                
+                # Check if it contains "5" text
+                button_region = screen[y:y+h, x:x+w]
+                if self._contains_five_text(button_region):
+                    return (x + w//2, y + h//2)
+        
+        # Strategy 3: Look for video icon
+        video_icon_pos = self._find_video_icon(screen)
+        if video_icon_pos:
+            return video_icon_pos
+        
+        return None
     
-    def structural_similarity(self, region1: np.ndarray, region2: np.ndarray) -> float:
-        """Calculate structural similarity index"""
-        # Resize to same size if needed
-        if region1.shape != region2.shape:
-            region2 = cv2.resize(region2, (region1.shape[1], region1.shape[0]))
-        
-        # Convert to grayscale
-        gray1 = cv2.cvtColor(region1, cv2.COLOR_BGR2GRAY)
-        gray2 = cv2.cvtColor(region2, cv2.COLOR_BGR2GRAY)
-        
-        # Calculate SSIM-like metric
-        c1 = 0.01 ** 2
-        c2 = 0.03 ** 2
-        
-        mu1 = cv2.GaussianBlur(gray1, (11, 11), 1.5)
-        mu2 = cv2.GaussianBlur(gray2, (11, 11), 1.5)
-        
-        mu1_sq = mu1 ** 2
-        mu2_sq = mu2 ** 2
-        mu1_mu2 = mu1 * mu2
-        
-        sigma1_sq = cv2.GaussianBlur(gray1 ** 2, (11, 11), 1.5) - mu1_sq
-        sigma2_sq = cv2.GaussianBlur(gray2 ** 2, (11, 11), 1.5) - mu2_sq
-        sigma12 = cv2.GaussianBlur(gray1 * gray2, (11, 11), 1.5) - mu1_mu2
-        
-        ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / \
-                   ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2))
-        
-        return float(np.mean(ssim_map))
+    def _contains_five_text(self, region: np.ndarray) -> bool:
+        """Check if region contains '5' text"""
+        try:
+            # Preprocess for OCR
+            gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+            _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+            
+            # OCR to find "5"
+            text = pytesseract.image_to_string(binary, config='--psm 8 -c tessedit_char_whitelist=0123456789')
+            return "5" in text
+        except:
+            return False
+    
+    def _find_video_icon(self, screen: np.ndarray) -> Optional[Tuple[int, int]]:
+        """Find video/play icon that might indicate ad button"""
+        # This would use template matching for video icon
+        if "video_icon" in self.template_cache:
+            result = self.template_match(screen, self.template_cache["video_icon"], threshold=0.7)
+            if result:
+                return result.location
+        return None
 
 class OCRProcessor:
     """Text recognition for game values"""
     
     def __init__(self):
-        self.digit_templates = self._load_digit_templates()
+        # Configure pytesseract path if needed
+        # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
         
-    def _load_digit_templates(self) -> dict:
-        """Load pre-saved digit templates"""
-        templates = {}
-        # This would load actual digit templates in production
-        return templates
-    
-    def extract_number(self, region: np.ndarray) -> Optional[int]:
-        """Extract numeric value from region"""
-        # Preprocess
-        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Precompile regex patterns
+        self.number_pattern = re.compile(r'[\d,]+')
+        self.wave_pattern = re.compile(r'Wave\s*(\d+)', re.IGNORECASE)
         
-        # Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Sort contours left to right
-        contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[0])
-        
-        digits = []
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            if h > region.shape[0] * 0.5:  # Filter small noise
-                digit_region = thresh[y:y+h, x:x+w]
-                digit = self._recognize_digit(digit_region)
-                if digit is not None:
-                    digits.append(str(digit))
-        
-        if digits:
-            return int(''.join(digits))
+    def extract_number_from_region(self, region: np.ndarray, 
+                                  preprocess: str = "thresh") -> Optional[int]:
+        """Extract numeric value from region with preprocessing"""
+        try:
+            # Preprocessing
+            gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+            
+            if preprocess == "thresh":
+                # Simple threshold
+                _, processed = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+            elif preprocess == "adaptive":
+                # Adaptive threshold for varying backgrounds
+                processed = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                cv2.THRESH_BINARY, 11, 2)
+            elif preprocess == "invert":
+                # Invert colors (white text on dark background)
+                _, processed = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
+            else:
+                processed = gray
+            
+            # Denoise
+            processed = cv2.medianBlur(processed, 3)
+            
+            # Scale up for better OCR
+            scale_factor = 2
+            width = int(processed.shape[1] * scale_factor)
+            height = int(processed.shape[0] * scale_factor)
+            processed = cv2.resize(processed, (width, height), interpolation=cv2.INTER_CUBIC)
+            
+            # OCR with digit whitelist
+            custom_config = '--psm 7 -c tessedit_char_whitelist=0123456789,.'
+            text = pytesseract.image_to_string(processed, config=custom_config)
+            
+            # Clean and parse
+            text = text.strip().replace(',', '').replace('.', '')
+            numbers = self.number_pattern.findall(text)
+            
+            if numbers:
+                return int(numbers[0])
+                
+        except Exception as e:
+            logger.debug(f"OCR failed: {e}")
+            
         return None
     
-    def _recognize_digit(self, digit_region: np.ndarray) -> Optional[int]:
-        """Recognize single digit using template matching"""
-        # Simplified - would use actual template matching or ML model
-        return None
+    def extract_text_from_region(self, region: np.ndarray) -> str:
+        """Extract text from region"""
+        try:
+            # Preprocess
+            gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+            _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+            
+            # OCR
+            text = pytesseract.image_to_string(binary, config='--psm 7')
+            return text.strip()
+            
+        except Exception as e:
+            logger.debug(f"Text extraction failed: {e}")
+            return ""
 
-# Global matcher instance
+# Global instances
 image_matcher = ImageMatcher()
 ocr_processor = OCRProcessor()
 
 def find_button(screen: np.ndarray, button_name: str) -> Optional[Tuple[int, int]]:
     """Find a specific button on screen"""
-    # Load button template
-    template_path = f"templates/buttons/{button_name}.png"
-    try:
-        template = cv2.imread(template_path)
-        if template is None:
-            return None
-            
+    # Special handling for ad button
+    if button_name == "5_gem_ad":
+        return image_matcher.detect_ad_button(screen)
+    
+    # Check template cache
+    if button_name in image_matcher.template_cache:
+        template = image_matcher.template_cache[button_name]
         result = image_matcher.template_match(screen, template)
-        if result and result.confidence > 0.8:
-            # Return center of button
-            h, w = template.shape[:2]
-            center_x = result.location[0] + w // 2
-            center_y = result.location[1] + h // 2
-            return (center_x, center_y)
-            
-    except Exception as e:
-        logger.error(f"Button detection failed: {e}")
-        
+        if result and result.confidence > 0.75:
+            return result.location
+    
+    # Fallback: try loading template directly
+    template_path = Path(f"templates/buttons/{button_name}.png")
+    if template_path.exists():
+        template = cv2.imread(str(template_path))
+        if template is not None:
+            result = image_matcher.template_match(screen, template)
+            if result and result.confidence > 0.75:
+                return result.location
+    
     return None
 
-def extract_game_values(screen: np.ndarray) -> dict:
+def extract_game_values(screen: np.ndarray) -> Dict[str, any]:
     """Extract numeric values from known screen regions"""
     values = {}
     
-    # Define regions for different values
+    # Define regions for different values (adjust based on your screen)
+    # These are for 720x1280 resolution
     regions = {
-        'gold': (100, 50, 200, 80),
-        'health': (300, 50, 400, 80),
-        'wave': (500, 50, 600, 80),
+        'gems': {
+            'bbox': (50, 10, 200, 60),  # Top-left gem counter
+            'preprocess': 'thresh',
+            'fallback_bbox': (520, 10, 670, 60)  # Alternative position
+        },
+        'gold': {
+            'bbox': (260, 10, 460, 60),  # Center-top gold counter
+            'preprocess': 'thresh'
+        },
+        'wave': {
+            'bbox': (500, 10, 650, 60),  # Top-right wave counter
+            'preprocess': 'thresh',
+            'text_region': True
+        },
+        'health': {
+            'bbox': (300, 100, 420, 140),  # Health bar region
+            'preprocess': 'adaptive'
+        }
     }
     
-    for name, (x1, y1, x2, y2) in regions.items():
-        region = screen[y1:y2, x1:x2]
-        value = ocr_processor.extract_number(region)
-        if value is not None:
-            values[name] = value
+    for name, config in regions.items():
+        try:
+            x1, y1, x2, y2 = config['bbox']
+            region = screen[y1:y2, x1:x2]
             
+            if config.get('text_region'):
+                # Extract text first (for "Wave X" format)
+                text = ocr_processor.extract_text_from_region(region)
+                match = ocr_processor.wave_pattern.search(text)
+                if match:
+                    values[name] = int(match.group(1))
+                else:
+                    # Try numeric extraction
+                    value = ocr_processor.extract_number_from_region(region, config['preprocess'])
+                    if value is not None:
+                        values[name] = value
+            else:
+                # Direct numeric extraction
+                value = ocr_processor.extract_number_from_region(region, config['preprocess'])
+                if value is not None:
+                    values[name] = value
+                elif 'fallback_bbox' in config:
+                    # Try fallback position
+                    x1, y1, x2, y2 = config['fallback_bbox']
+                    region = screen[y1:y2, x1:x2]
+                    value = ocr_processor.extract_number_from_region(region, config['preprocess'])
+                    if value is not None:
+                        values[name] = value
+                        
+        except Exception as e:
+            logger.debug(f"Failed to extract {name}: {e}")
+    
+    # Log extracted values for debugging
+    if values:
+        logger.debug(f"Extracted values: {values}")
+    
     return values
+
+def detect_spinning_gem(screen: np.ndarray, tower_center: Tuple[int, int] = (360, 640),
+                       orbit_radius: int = 200) -> Optional[Tuple[int, int]]:
+    """Detect spinning gem around tower"""
+    # Create orbital mask
+    mask = np.zeros(screen.shape[:2], np.uint8)
+    cv2.circle(mask, tower_center, orbit_radius + 50, 255, -1)
+    cv2.circle(mask, tower_center, orbit_radius - 50, 0, -1)
+    
+    # Convert to HSV for color detection
+    hsv = cv2.cvtColor(screen, cv2.COLOR_BGR2HSV)
+    
+    # Spinning gem is typically bright cyan/blue
+    lower_cyan = np.array([85, 150, 150])
+    upper_cyan = np.array([95, 255, 255])
+    
+    # Alternative: bright white/yellow gems
+    lower_bright = np.array([20, 100, 200])
+    upper_bright = np.array([30, 255, 255])
+    
+    # Create color masks
+    cyan_mask = cv2.inRange(hsv, lower_cyan, upper_cyan)
+    bright_mask = cv2.inRange(hsv, lower_bright, upper_bright)
+    
+    # Combine color masks
+    color_mask = cv2.bitwise_or(cyan_mask, bright_mask)
+    
+    # Apply orbital mask
+    gem_mask = cv2.bitwise_and(color_mask, mask)
+    
+    # Morphological operations to clean up
+    kernel = np.ones((5, 5), np.uint8)
+    gem_mask = cv2.morphologyEx(gem_mask, cv2.MORPH_CLOSE, kernel)
+    gem_mask = cv2.morphologyEx(gem_mask, cv2.MORPH_OPEN, kernel)
+    
+    # Find contours
+    contours, _ = cv2.findContours(gem_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Look for gem-sized objects
+    best_contour = None
+    best_score = 0
+    
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if 200 < area < 3000:  # Gem size range
+            # Calculate circularity
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter > 0:
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+                
+                # Gems are typically circular
+                if circularity > 0.6:
+                    # Calculate center
+                    M = cv2.moments(contour)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        
+                        # Verify it's in orbital path
+                        dist = np.sqrt((cx - tower_center[0])**2 + (cy - tower_center[1])**2)
+                        orbital_score = 1.0 - abs(dist - orbit_radius) / orbit_radius
+                        
+                        if orbital_score > 0.7:
+                            score = circularity * orbital_score
+                            if score > best_score:
+                                best_score = score
+                                best_contour = (cx, cy)
+    
+    if best_contour:
+        logger.debug(f"Spinning gem detected at {best_contour}")
+        return best_contour
+    
+    return None
+
+def find_ui_element(screen: np.ndarray, element_type: str) -> Optional[Tuple[int, int]]:
+    """Find various UI elements by type"""
+    # Common UI element positions (adjust for your screen)
+    ui_positions = {
+        'workshop_button': (100, 1200),
+        'lab_button': (200, 1200),
+        'cards_button': (300, 1200),
+        'modules_button': (400, 1200),
+        'settings_button': (650, 50),
+        'back_button': (50, 50),
+        'ultimate_golden_tower': (100, 600),
+        'ultimate_black_hole': (620, 600),
+    }
+    
+    # First try known positions
+    if element_type in ui_positions:
+        return ui_positions[element_type]
+    
+    # Then try template matching
+    return find_button(screen, element_type)
+
+def verify_screen_state(screen: np.ndarray, expected_state: str) -> bool:
+    """Verify we're on the expected screen"""
+    # Simple verification using key elements
+    verifications = {
+        'home': lambda s: find_button(s, 'start_wave') is not None,
+        'in_wave': lambda s: extract_game_values(s).get('wave') is not None,
+        'game_over': lambda s: find_button(s, 'retry') is not None,
+        'workshop': lambda s: find_button(s, 'workshop_close') is not None,
+        'watching_ad': lambda s: is_screen_mostly_black(s) or find_button(s, 'skip_ad') is not None,
+    }
+    
+    if expected_state in verifications:
+        return verifications[expected_state](screen)
+    
+    return False
+
+def is_screen_mostly_black(screen: np.ndarray, threshold: float = 0.9) -> bool:
+    """Check if screen is mostly black (ad playing)"""
+    gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
+    black_pixels = np.sum(gray < 30)
+    total_pixels = gray.size
+    black_ratio = black_pixels / total_pixels
+    return black_ratio > threshold
+
+def save_debug_image(image: np.ndarray, name: str, directory: str = "debug"):
+    """Save image for debugging"""
+    debug_dir = Path(directory)
+    debug_dir.mkdir(exist_ok=True)
+    
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = debug_dir / f"{name}_{timestamp}.png"
+    
+    cv2.imwrite(str(filename), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+    logger.debug(f"Saved debug image: {filename}")

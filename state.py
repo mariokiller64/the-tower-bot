@@ -1,4 +1,4 @@
-# state.py - Updated with latest OpenCV 4.11 features and optimizations
+# state.py - Updated with gem farming states and detection
 from abc import ABC, abstractmethod
 from PIL import Image
 import numpy as np
@@ -8,6 +8,7 @@ import cv2
 import logging
 from pathlib import Path
 import json
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -310,12 +311,17 @@ class GameState:
         self.wave_number = 0
         self.health = 100
         self.gold = 0
+        self.gems = 0  # Added gem tracking
         self.last_state = None
         self.state_duration = 0
         self.total_runs = 0
         self.best_wave = 0
         self.current_run_start = None
         self.upgrade_counts = {}
+        self.gems_collected = 0  # Total gems farmed
+        self.ads_watched = 0  # Total ad gems claimed
+        self.spinning_gems_collected = 0  # Total spinning gems
+        self.in_wave = False  # Track if currently in wave
         
     def update(self, current_state: State):
         """Update game state tracking"""
@@ -327,6 +333,11 @@ class GameState:
             if isinstance(current_state, GameOverState):
                 self.best_wave = max(self.best_wave, self.wave_number)
                 self.total_runs += 1
+                self.in_wave = False
+            elif isinstance(current_state, (PlayAttackState, PlayDefenseState, PlayUtilityState)):
+                self.in_wave = True
+            elif isinstance(current_state, MenuState):
+                self.in_wave = False
                 
         else:
             self.state_duration += 1
@@ -334,6 +345,18 @@ class GameState:
     def track_upgrade(self, upgrade_type: str):
         """Track upgrade purchases"""
         self.upgrade_counts[upgrade_type] = self.upgrade_counts.get(upgrade_type, 0) + 1
+    
+    def track_gem_collection(self, amount: int, source: str = "unknown"):
+        """Track gem collection"""
+        self.gems += amount
+        self.gems_collected += amount
+        
+        if source == "ad":
+            self.ads_watched += 1
+        elif source == "spinning":
+            self.spinning_gems_collected += 1
+        
+        logger.info(f"💎 Collected {amount} gems from {source}! Total: {self.gems}")
 
 # Concrete State Implementations
 class MenuState(State):
@@ -354,7 +377,7 @@ class MenuState(State):
     def execute_strategy(self, device, capture, game_state):
         logger.info("In menu, starting new game")
         device.tap_point(self.get_action_point('play'))
-        game_state.current_run_start = np.datetime64('now')
+        game_state.current_run_start = time.time()
 
 class PlayAttackState(State):
     def __init__(self):
@@ -514,26 +537,213 @@ class GameOverState(State):
         # Quick retry
         device.tap_point(self.get_action_point('retry'))
 
+# NEW GEM FARMING STATES
+class AdGemState(State):
+    """Handles 5-gem ad button detection and claiming"""
+    def __init__(self):
+        super().__init__(
+            name="AdGemState",
+            regions=[
+                # Ad button typically appears around 80% screen height, centered
+                Region(300, 960, 120, 120, weight=1.0, name="ad_gem_button"),
+                Region(320, 980, 80, 80, weight=0.8, name="gem_number"),  # "5" text
+                Region(340, 1000, 40, 40, weight=0.6, name="video_icon"),
+            ],
+            actions={
+                'tap_ad': (360, 1020),  # Center of ad button
+                'claim': (360, 800),    # Typical claim button location
+                'close': (650, 200),    # X button top-right
+                'close_alt': (360, 1100),  # Alternative close location
+            },
+            config=StateConfig(min_confidence=0.75)  # Lower threshold for ad detection
+        )
+        self.last_ad_time = 0
+        self.ad_cooldown = 720  # 12 minutes
+    
+    def execute_strategy(self, device, capture, game_state):
+        """Claim 5-gem ad reward"""
+        logger.info("📺 Found 5-gem ad button! Claiming...")
+        
+        # Store current gems for verification
+        from image_operation import extract_game_values
+        values = extract_game_values(capture)
+        gems_before = values.get('gems', game_state.gems)
+        
+        # Tap ad button
+        device.tap_point(self.get_action_point('tap_ad'))
+        
+        # Wait for ad to play (60 seconds as specified)
+        logger.info("⏳ Watching ad for 60 seconds...")
+        for i in range(60):
+            time.sleep(1)
+            if i % 10 == 0:
+                logger.info(f"   {60-i} seconds remaining...")
+        
+        # Look for claim/close button
+        logger.info("✅ Ad finished, looking for claim button...")
+        time.sleep(1)
+        
+        # Try multiple close button locations
+        for action in ['claim', 'close', 'close_alt']:
+            device.tap_point(self.get_action_point(action))
+            time.sleep(0.5)
+        
+        # Verify gem increase
+        time.sleep(2)
+        new_capture = device.capture()
+        new_values = extract_game_values(new_capture)
+        gems_after = new_values.get('gems', game_state.gems)
+        
+        if gems_after > gems_before:
+            game_state.track_gem_collection(gems_after - gems_before, "ad")
+            logger.info(f"💎 SUCCESS! Gems: {gems_before} → {gems_after} (+{gems_after - gems_before})")
+        else:
+            logger.warning("⚠️ Could not verify gem increase")
+        
+        self.last_ad_time = time.time()
+
+class WatchingAdState(State):
+    """State while watching an ad"""
+    def __init__(self):
+        super().__init__(
+            name="WatchingAdState",
+            regions=[
+                # Ad playing indicators
+                Region(0, 0, 720, 1280, weight=1.0, name="full_screen_ad"),
+                Region(650, 50, 50, 50, weight=0.8, name="skip_button"),
+            ],
+            actions={
+                'wait': (360, 640),  # Just wait
+            }
+        )
+    
+    def execute_strategy(self, device, capture, game_state):
+        """Just wait for ad to finish"""
+        logger.debug("Watching ad...")
+        time.sleep(1)  # Don't do anything while ad plays
+
+class SpinningGemDetector:
+    """Specialized detector for moving 2-gem diamond"""
+    def __init__(self):
+        self.tower_center = (360, 640)
+        self.orbit_radius = 200
+        self.last_gem_position = None
+        self.last_detection_time = 0
+        self.gem_cooldown = 30  # Gem respawns roughly every 30 seconds in wave
+        
+    def detect_spinning_gem(self, capture: np.ndarray, game_state: GameState) -> Optional[Tuple[int, int]]:
+        """Detect the spinning 2-gem diamond"""
+        if not game_state.in_wave:
+            return None
+            
+        # Check cooldown
+        if time.time() - self.last_detection_time < self.gem_cooldown:
+            return None
+        
+        # Create mask for orbital area
+        mask = np.zeros(capture.shape[:2], np.uint8)
+        cv2.circle(mask, self.tower_center, self.orbit_radius + 50, 255, -1)
+        cv2.circle(mask, self.tower_center, self.orbit_radius - 50, 0, -1)
+        
+        # Load gem template if available
+        gem_template_path = Path('templates/spinning_gem.png')
+        if not gem_template_path.exists():
+            # Use color detection as fallback
+            return self._detect_by_color(capture, mask)
+        
+        # Template matching
+        gem_template = cv2.imread(str(gem_template_path))
+        if gem_template is None:
+            return self._detect_by_color(capture, mask)
+        
+        # Apply mask and search
+        masked_capture = cv2.bitwise_and(capture, capture, mask=mask)
+        
+        # Try multiple scales
+        best_match = None
+        best_val = 0
+        
+        for scale in [0.8, 1.0, 1.2]:
+            width = int(gem_template.shape[1] * scale)
+            height = int(gem_template.shape[0] * scale)
+            scaled_template = cv2.resize(gem_template, (width, height))
+            
+            result = cv2.matchTemplate(masked_capture, scaled_template, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+            
+            if max_val > best_val and max_val > 0.7:
+                best_val = max_val
+                h, w = scaled_template.shape[:2]
+                best_match = (max_loc[0] + w//2, max_loc[1] + h//2)
+        
+        if best_match:
+            self.last_gem_position = best_match
+            self.last_detection_time = time.time()
+            logger.info(f"🔹 Found spinning gem at {best_match}!")
+            return best_match
+        
+        return None
+    
+    def _detect_by_color(self, capture: np.ndarray, mask: np.ndarray) -> Optional[Tuple[int, int]]:
+        """Fallback color-based detection for spinning gem"""
+        # Convert to HSV for better color detection
+        hsv = cv2.cvtColor(capture, cv2.COLOR_BGR2HSV)
+        
+        # Gem is typically cyan/blue color
+        lower_cyan = np.array([80, 100, 100])
+        upper_cyan = np.array([100, 255, 255])
+        
+        # Threshold the HSV image
+        color_mask = cv2.inRange(hsv, lower_cyan, upper_cyan)
+        
+        # Combine with orbital mask
+        combined_mask = cv2.bitwise_and(color_mask, mask)
+        
+        # Find contours
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Find gem-sized contours
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if 100 < area < 2000:  # Gem size range
+                M = cv2.moments(contour)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    
+                    # Verify it's in orbital path
+                    dist = np.sqrt((cx - self.tower_center[0])**2 + (cy - self.tower_center[1])**2)
+                    if abs(dist - self.orbit_radius) < 50:
+                        self.last_detection_time = time.time()
+                        return (cx, cy)
+        
+        return None
+
 class StateManager:
-    """Enhanced state detection and management"""
+    """Enhanced state detection and management with gem focus"""
     def __init__(self, config_path: Optional[Path] = None):
         self.states = self._initialize_states()
         self.game_state = GameState()
         self.unknown_state_count = 0
         self.confidence_history = []
         self.state_transition_matrix = {}
+        self.spinning_gem_detector = SpinningGemDetector()
+        self.last_ad_check = 0
+        self.ad_check_interval = 600  # 10 minutes
         
         if config_path and config_path.exists():
             self.load_config(config_path)
     
     def _initialize_states(self) -> List[State]:
-        """Initialize all game states"""
+        """Initialize all game states including gem states"""
         return [
             MenuState(),
             PlayAttackState(),
             PlayDefenseState(),
             PlayUtilityState(),
             GameOverState(),
+            AdGemState(),
+            WatchingAdState(),
         ]
     
     def detect_state(self, capture: np.ndarray) -> Optional[State]:
@@ -541,6 +751,17 @@ class StateManager:
         # Convert PIL to numpy if needed
         if isinstance(capture, Image.Image):
             capture = np.array(capture)
+        
+        # Priority check for ad gem button (highest value)
+        current_time = time.time()
+        if current_time - self.last_ad_check >= self.ad_check_interval:
+            ad_state = next((s for s in self.states if isinstance(s, AdGemState)), None)
+            if ad_state:
+                ad_confidence = ad_state.calculate_confidence(capture)
+                if ad_confidence >= ad_state.config.min_confidence:
+                    logger.info(f"🎯 AD GEM DETECTED! Confidence: {ad_confidence:.2%}")
+                    self.last_ad_check = current_time
+                    return ad_state
         
         # Calculate confidence for each state
         confidences = {}
@@ -588,6 +809,24 @@ class StateManager:
                 
             return None
     
+    def check_spinning_gem(self, device, capture: np.ndarray) -> bool:
+        """Check for and collect spinning gem"""
+        gem_position = self.spinning_gem_detector.detect_spinning_gem(capture, self.game_state)
+        
+        if gem_position:
+            # Tap immediately with slight randomization
+            tap_x = gem_position[0] + np.random.randint(-10, 10)
+            tap_y = gem_position[1] + np.random.randint(-10, 10)
+            
+            device.tap_xy(tap_x, tap_y)
+            
+            # Track collection
+            self.game_state.track_gem_collection(2, "spinning")
+            
+            return True
+        
+        return False
+    
     def _track_transition(self, new_state: State):
         """Track state transitions for prediction"""
         if self.game_state.last_state:
@@ -612,7 +851,11 @@ class StateManager:
         return None
     
     def execute_current_state(self, device, capture: np.ndarray):
-        """Execute strategy for current state"""
+        """Execute strategy for current state with gem priority"""
+        # Always check for spinning gem first if in wave
+        if self.game_state.in_wave:
+            self.check_spinning_gem(device, capture)
+        
         state = self.detect_state(capture)
         
         if state:
@@ -628,6 +871,9 @@ class StateManager:
             'statistics': {
                 'total_runs': self.game_state.total_runs,
                 'best_wave': self.game_state.best_wave,
+                'total_gems_collected': self.game_state.gems_collected,
+                'ads_watched': self.game_state.ads_watched,
+                'spinning_gems': self.game_state.spinning_gems_collected,
                 'transition_matrix': {
                     f"{k[0]}->{k[1]}": v 
                     for k, v in self.state_transition_matrix.items()
@@ -654,6 +900,9 @@ class StateManager:
             stats = config.get('statistics', {})
             self.game_state.total_runs = stats.get('total_runs', 0)
             self.game_state.best_wave = stats.get('best_wave', 0)
+            self.game_state.gems_collected = stats.get('total_gems_collected', 0)
+            self.game_state.ads_watched = stats.get('ads_watched', 0)
+            self.game_state.spinning_gems_collected = stats.get('spinning_gems', 0)
             
             # Load transition matrix
             matrix = stats.get('transition_matrix', {})
@@ -667,5 +916,5 @@ class StateManager:
             logger.error(f"Failed to load config: {e}")
 
 def create_state_manager(config_path: Optional[Path] = None) -> StateManager:
-    """Create and configure state manager"""
+    """Create and configure state manager with gem farming focus"""
     return StateManager(config_path)

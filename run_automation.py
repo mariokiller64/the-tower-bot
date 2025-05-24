@@ -1,4 +1,4 @@
-# run_automation.py - Complete rewrite with adaptive timing and recovery
+# run_automation.py - Gem farming focused automation
 import logging
 import signal
 import sys
@@ -13,8 +13,8 @@ import threading
 import queue
 
 from android_device import AndroidDevice
-from state import create_state_manager, StateManager
-from image_operation import extract_game_values, find_button
+from state import create_state_manager, StateManager, AdGemState
+from image_operation import extract_game_values, find_button, detect_spinning_gem
 
 # Configure logging
 logging.basicConfig(
@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class AutomationConfig:
-   """Configuration management with hot-reload support"""
+   """Configuration for gem-focused automation"""
    def __init__(self, config_file: str = "config.json"):
        self.config_file = Path(config_file)
        self.load_defaults()
@@ -36,19 +36,31 @@ class AutomationConfig:
        self._last_modified = self.config_file.stat().st_mtime if self.config_file.exists() else 0
    
    def load_defaults(self):
-       """Set default configuration"""
-       self.app_package = 'com.TechTreeGames.TheTower'
+       """Set default configuration for gem farming"""
+       self.app_package = 'com.techtreegames.thetower'
        self.device_id = 'auto'
-       self.base_delay = 1.0
-       self.adaptive_timing = True
-       self.max_unknown_states = 10
+       
+       # Timing settings for gem farming
+       self.main_loop_interval = 60  # Check every 60 seconds (user configurable)
+       self.ad_check_interval = 600  # Check for ad every 10 minutes
+       self.spinning_gem_check_interval = 15  # Check for spinning gem every 15 seconds in wave
+       self.ad_watch_duration = 60  # 60 second ads
+       
+       # Features
+       self.enable_ocr = True
+       self.gem_farming_mode = True
+       self.auto_upgrades = True
+       self.auto_wave_start = True
+       
+       # Paths
        self.screenshot_dir = Path("screenshots")
-       self.save_unknown_states = True
-       self.performance_mode = "balanced"  # "fast", "balanced", "quality"
-       self.enable_ocr = False
-       self.enable_predictions = True
-       self.multi_threading = True
+       self.template_dir = Path("templates")
        self.state_config_path = Path("state_config.json")
+       
+       # Performance
+       self.save_debug_screenshots = False
+       self.randomize_taps = True
+       self.tap_delay_range = (0.5, 1.0)
        
    def load_from_file(self):
        """Load configuration from JSON file"""
@@ -59,25 +71,12 @@ class AutomationConfig:
                    for key, value in data.items():
                        if hasattr(self, key):
                            # Convert Path strings back to Path objects
-                           if key in ['screenshot_dir', 'state_config_path'] and isinstance(value, str):
+                           if key.endswith('_dir') or key.endswith('_path'):
                                value = Path(value)
                            setattr(self, key, value)
                logger.info(f"Loaded config from {self.config_file}")
        except Exception as e:
            logger.warning(f"Failed to load config: {e}")
-   
-   def check_reload(self):
-       """Check if config file has been modified and reload if needed"""
-       if not self.config_file.exists():
-           return False
-           
-       current_mtime = self.config_file.stat().st_mtime
-       if current_mtime > self._last_modified:
-           logger.info("Config file changed, reloading...")
-           self.load_from_file()
-           self._last_modified = current_mtime
-           return True
-       return False
    
    def save_to_file(self):
        """Save current configuration"""
@@ -94,192 +93,76 @@ class AutomationConfig:
            json.dump(data, f, indent=2)
        self._last_modified = self.config_file.stat().st_mtime
 
-class PerformanceMonitor:
-   """Monitor and optimize automation performance"""
-   def __init__(self, window_size: int = 100):
-       self.window_size = window_size
-       self.cycle_times = deque(maxlen=window_size)
-       self.capture_times = deque(maxlen=window_size)
-       self.process_times = deque(maxlen=window_size)
-       self.state_confidences = deque(maxlen=window_size)
-       self.memory_usage = deque(maxlen=window_size)
+class GemFarmingStats:
+   """Track gem farming performance"""
+   def __init__(self):
+       self.session_start = time.time()
+       self.gems_start = 0
+       self.gems_current = 0
+       self.ads_watched = 0
+       self.spinning_gems_collected = 0
+       self.ad_attempts = 0
+       self.ad_failures = 0
+       self.last_ad_time = 0
+       self.gem_history = deque(maxlen=100)
        
-   def record_cycle(self, cycle_time: float, capture_time: float, 
-                   process_time: float, confidence: float = 1.0):
-       """Record performance metrics for a cycle"""
-       self.cycle_times.append(cycle_time)
-       self.capture_times.append(capture_time)
-       self.process_times.append(process_time)
-       self.state_confidences.append(confidence)
-       
-       # Track memory usage
-       try:
-           import psutil
-           process = psutil.Process()
-           memory_mb = process.memory_info().rss / 1024 / 1024
-           self.memory_usage.append(memory_mb)
-       except ImportError:
-           pass
+   def update_gems(self, new_gem_count: int):
+       """Update gem count and track changes"""
+       if new_gem_count > self.gems_current:
+           gain = new_gem_count - self.gems_current
+           self.gem_history.append({
+               'time': time.time(),
+               'amount': gain,
+               'total': new_gem_count
+           })
+       self.gems_current = new_gem_count
    
-   def get_stats(self) -> Dict[str, float]:
-       """Get performance statistics"""
-       stats = {}
+   def get_gems_per_hour(self) -> float:
+       """Calculate gems per hour rate"""
+       runtime = time.time() - self.session_start
+       if runtime < 60:  # Need at least 1 minute
+           return 0.0
        
-       if self.cycle_times:
-           stats['avg_cycle_time'] = np.mean(self.cycle_times)
-           stats['min_cycle_time'] = np.min(self.cycle_times)
-           stats['max_cycle_time'] = np.max(self.cycle_times)
-           
-       if self.capture_times:
-           stats['avg_capture_time'] = np.mean(self.capture_times)
-           
-       if self.process_times:
-           stats['avg_process_time'] = np.mean(self.process_times)
-           
-       if self.state_confidences:
-           stats['avg_confidence'] = np.mean(self.state_confidences)
-           stats['min_confidence'] = np.min(self.state_confidences)
-           
-       if self.memory_usage:
-           stats['avg_memory_mb'] = np.mean(self.memory_usage)
-           stats['max_memory_mb'] = np.max(self.memory_usage)
-           
-       return stats
+       total_gained = self.gems_current - self.gems_start
+       hours = runtime / 3600
+       return total_gained / hours if hours > 0 else 0.0
    
-   def suggest_optimizations(self) -> List[str]:
-       """Suggest performance optimizations based on metrics"""
-       suggestions = []
-       stats = self.get_stats()
+   def get_summary(self) -> Dict[str, any]:
+       """Get farming statistics summary"""
+       runtime = time.time() - self.session_start
+       total_gained = self.gems_current - self.gems_start
        
-       if stats.get('avg_cycle_time', 0) > 2.0:
-           suggestions.append("Consider reducing image processing quality for faster cycles")
-           
-       if stats.get('avg_capture_time', 0) > 0.5:
-           suggestions.append("Screenshot capture is slow - check ADB connection")
-           
-       if stats.get('avg_confidence', 1.0) < 0.7:
-           suggestions.append("Low detection confidence - update reference images")
-           
-       if stats.get('max_memory_mb', 0) > 500:
-           suggestions.append("High memory usage - consider restarting periodically")
-           
-       return suggestions
-
-class AdaptiveTiming:
-   """Intelligent delay management based on game state and performance"""
-   def __init__(self, base_delay: float = 1.0):
-       self.base_delay = base_delay
-       self.state_delays = {
-           'MenuState': 2.0,
-           'GameOverState': 3.0,
-           'PlayAttackState': 0.5,
-           'PlayDefenseState': 0.5,
-           'PlayUtilityState': 0.5,
+       return {
+           'runtime_hours': runtime / 3600,
+           'total_gems_gained': total_gained,
+           'gems_per_hour': self.get_gems_per_hour(),
+           'ads_watched': self.ads_watched,
+           'ad_success_rate': (self.ads_watched / max(1, self.ad_attempts)) * 100,
+           'spinning_gems': self.spinning_gems_collected,
+           'current_gems': self.gems_current,
        }
-       self.performance_factor = 1.0
-       self.confidence_factor = 1.0
-       self.recent_errors = deque(maxlen=10)
-       
-   def get_delay(self, state_name: Optional[str], confidence: float = 1.0) -> float:
-       """Calculate adaptive delay for current state"""
-       # Base delay for state
-       if not state_name:
-           base = self.base_delay * 2  # Longer delay when lost
-       else:
-           base = self.state_delays.get(state_name, self.base_delay)
-       
-       # Adjust based on confidence
-       if confidence < 0.9:
-           self.confidence_factor = min(1.5, self.confidence_factor + 0.1)
-       else:
-           self.confidence_factor = max(0.8, self.confidence_factor - 0.05)
-       
-       # Adjust based on recent errors
-       error_rate = sum(self.recent_errors) / max(1, len(self.recent_errors))
-       if error_rate > 0.3:
-           self.performance_factor = min(2.0, self.performance_factor + 0.1)
-       else:
-           self.performance_factor = max(0.5, self.performance_factor - 0.05)
-       
-       return base * self.performance_factor * self.confidence_factor
-   
-   def record_error(self, had_error: bool):
-       """Track error rate for adjustment"""
-       self.recent_errors.append(1 if had_error else 0)
-
-class AsyncScreenCapture:
-   """Asynchronous screenshot capture for better performance"""
-   def __init__(self, device: AndroidDevice):
-       self.device = device
-       self.capture_queue = queue.Queue(maxsize=2)
-       self.running = False
-       self.thread = None
-       
-   def start(self):
-       """Start async capture thread"""
-       self.running = True
-       self.thread = threading.Thread(target=self._capture_loop, daemon=True)
-       self.thread.start()
-       
-   def stop(self):
-       """Stop capture thread"""
-       self.running = False
-       if self.thread:
-           self.thread.join(timeout=2)
-           
-   def _capture_loop(self):
-       """Continuous capture loop"""
-       while self.running:
-           try:
-               capture = self.device.capture()
-               if capture is not None:
-                   # Discard old capture if queue is full
-                   if self.capture_queue.full():
-                       try:
-                           self.capture_queue.get_nowait()
-                       except queue.Empty:
-                           pass
-                   
-                   self.capture_queue.put((time.time(), capture))
-               else:
-                   time.sleep(0.1)
-                   
-           except Exception as e:
-               logger.error(f"Capture thread error: {e}")
-               time.sleep(1)
-   
-   def get_latest(self, timeout: float = 1.0) -> Optional[Tuple[float, np.ndarray]]:
-       """Get latest capture with timestamp"""
-       try:
-           return self.capture_queue.get(timeout=timeout)
-       except queue.Empty:
-           return None
 
 class TowerAutomation:
-   """Main automation controller with advanced features"""
+   """Main automation controller focused on gem farming"""
    def __init__(self, config: AutomationConfig):
        self.config = config
        self.device = None
        self.state_manager = create_state_manager(
            config.state_config_path if config.state_config_path.exists() else None
        )
-       self.timing = AdaptiveTiming(config.base_delay)
-       self.performance = PerformanceMonitor()
-       self.async_capture = None
        self.running = False
+       self.gem_stats = GemFarmingStats()
        
-       # Statistics
-       self.stats = {
-           'start_time': time.time(),
-           'cycles': 0,
-           'errors': 0,
-           'unknown_states': 0,
-           'captures_failed': 0,
-           'actions_performed': 0,
-       }
+       # Timing trackers
+       self.last_main_loop = 0
+       self.last_ad_check = 0
+       self.last_spinning_check = 0
+       self.last_ad_success = 0
+       self.ad_retry_count = 0
        
-       # Game value tracking
-       self.game_values_history = deque(maxlen=100)
+       # State tracking
+       self.in_wave = False
+       self.watching_ad = False
        
        # Setup signal handlers
        signal.signal(signal.SIGINT, self._signal_handler)
@@ -287,7 +170,7 @@ class TowerAutomation:
        
        # Create directories
        self.config.screenshot_dir.mkdir(exist_ok=True)
-       (self.config.screenshot_dir / "unknown_states").mkdir(exist_ok=True)
+       self.config.template_dir.mkdir(exist_ok=True)
        
    def _signal_handler(self, sig, frame):
        """Handle shutdown signals gracefully"""
@@ -298,13 +181,7 @@ class TowerAutomation:
        """Establish device connection"""
        try:
            self.device = AndroidDevice(self.config.device_id)
-           
-           # Start async capture if enabled
-           if self.config.multi_threading:
-               self.async_capture = AsyncScreenCapture(self.device)
-               self.async_capture.start()
-               logger.info("Started asynchronous capture")
-               
+           logger.info(f"Connected to device: {self.config.device_id}")
            return True
        except Exception as e:
            logger.error(f"Failed to connect to device: {e}")
@@ -324,284 +201,199 @@ class TowerAutomation:
                
        return True
    
-   def save_unknown_state(self, capture: np.ndarray, confidence_scores: Dict[str, float]):
-       """Save screenshot of unknown state for analysis"""
-       if not self.config.save_unknown_states:
-           return
-           
-       timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-       
-       # Save screenshot
-       screenshot_path = self.config.screenshot_dir / "unknown_states" / f"unknown_{timestamp}.png"
-       try:
-           import cv2
-           cv2.imwrite(str(screenshot_path), cv2.cvtColor(capture, cv2.COLOR_RGB2BGR))
-           
-           # Save metadata
-           metadata = {
-               'timestamp': timestamp,
-               'confidence_scores': confidence_scores,
-               'game_values': self.game_values_history[-1] if self.game_values_history else {},
-               'previous_state': self.state_manager.game_state.last_state.name 
-                   if self.state_manager.game_state.last_state else None,
-           }
-           
-           metadata_path = screenshot_path.with_suffix('.json')
-           with open(metadata_path, 'w') as f:
-               json.dump(metadata, f, indent=2)
-               
-           logger.info(f"Saved unknown state to {screenshot_path}")
-           
-       except Exception as e:
-           logger.error(f"Failed to save unknown state: {e}")
-   
-   def extract_game_values_safe(self, capture: np.ndarray) -> Dict[str, any]:
-       """Safely extract game values with fallback"""
-       if not self.config.enable_ocr:
-           return {}
-           
-       try:
-           values = extract_game_values(capture)
-           self.game_values_history.append(values)
-           
-           # Update game state with extracted values
-           if 'health' in values:
-               self.state_manager.game_state.health = values['health']
-           if 'gold' in values:
-               self.state_manager.game_state.gold = values['gold']
-           if 'wave' in values:
-               self.state_manager.game_state.wave_number = values['wave']
-               
-           return values
-           
-       except Exception as e:
-           logger.error(f"Failed to extract game values: {e}")
-           return {}
-   
-   def run_cycle(self):
-       """Execute one automation cycle with performance tracking"""
-       cycle_start = time.time()
-       had_error = False
+   def check_ad_gem(self) -> bool:
+       """Priority 1: Check and claim 5-gem ad"""
+       logger.info("🔍 Checking for ad gem button...")
+       self.gem_stats.ad_attempts += 1
        
        try:
-           # Get screenshot
-           capture_start = time.time()
-           
-           if self.async_capture:
-               # Use async capture
-               result = self.async_capture.get_latest()
-               if result:
-                   capture_timestamp, capture = result
-                   # Check if capture is too old
-                   if time.time() - capture_timestamp > 2.0:
-                       capture = self.device.capture()
-               else:
-                   capture = self.device.capture()
-           else:
-               # Synchronous capture
-               capture = self.device.capture()
-               
-           capture_time = time.time() - capture_start
-           
+           # Take screenshot
+           capture = self.device.capture()
            if capture is None:
-               logger.error("Capture failed")
-               self.stats['captures_failed'] += 1
-               self.stats['errors'] += 1
-               had_error = True
-               return
+               logger.error("Failed to capture screen")
+               return False
            
-           # Process state and execute actions
-           process_start = time.time()
+           # Extract current gems for verification
+           values = extract_game_values(capture)
+           gems_before = values.get('gems', self.gem_stats.gems_current)
+           self.gem_stats.update_gems(gems_before)
            
-           # Extract game values if enabled
-           if self.config.enable_ocr:
-               self.extract_game_values_safe(capture)
+           # Look for ad button
+           ad_button = find_button(capture, "5_gem_ad")
            
-           # Detect current state
-           current_state = self.state_manager.detect_state(capture)
+           if not ad_button:
+               logger.info("No ad button found")
+               return False
            
-           # Get confidence scores for logging
-           confidence = 0.0
-           confidence_scores = {}
-           if hasattr(self.state_manager, 'confidence_history') and self.state_manager.confidence_history:
-               latest = self.state_manager.confidence_history[-1]
-               confidence = latest.get('confidence', 0.0)
-               confidence_scores = latest.get('all_confidences', {})
+           logger.info(f"📺 Found 5-gem ad button at {ad_button}!")
            
-           if current_state:
-               logger.info(f"State: {current_state.name} (confidence: {confidence:.2f})")
-               self.state_manager.execute_current_state(self.device, capture)
-               self.stats['actions_performed'] += 1
-               self.stats['unknown_states'] = 0
+           # Tap ad button with randomization
+           if self.config.randomize_taps:
+               tap_x = ad_button[0] + np.random.randint(-10, 10)
+               tap_y = ad_button[1] + np.random.randint(-10, 10)
            else:
-               self.stats['unknown_states'] += 1
-               logger.warning(f"Unknown state ({self.stats['unknown_states']} consecutive)")
-               
-               if self.stats['unknown_states'] >= self.config.max_unknown_states:
-                   self.save_unknown_state(capture, confidence_scores)
-                   self.handle_lost_state()
+               tap_x, tap_y = ad_button
            
-           process_time = time.time() - process_start
+           self.device.tap_xy(tap_x, tap_y)
+           time.sleep(2)  # Wait for ad to start
            
-           # Record performance metrics
-           cycle_time = time.time() - cycle_start
-           self.performance.record_cycle(cycle_time, capture_time, process_time, confidence)
+           # Watch ad
+           self.watching_ad = True
+           logger.info(f"⏳ Watching ad for {self.config.ad_watch_duration} seconds...")
            
-           # Adaptive delay
-           delay = self.timing.get_delay(
-               current_state.name if current_state else None,
-               confidence
-           )
+           # Show countdown
+           for remaining in range(self.config.ad_watch_duration, 0, -10):
+               logger.info(f"   {remaining} seconds remaining...")
+               time.sleep(min(10, remaining))
            
-           if cycle_time < delay:
-               time.sleep(delay - cycle_time)
+           self.watching_ad = False
            
-           self.stats['cycles'] += 1
-           
-       except Exception as e:
-           logger.error(f"Cycle error: {e}", exc_info=True)
-           self.stats['errors'] += 1
-           had_error = True
-           
-       finally:
-           self.timing.record_error(had_error)
-   
-   def handle_lost_state(self):
-       """Advanced recovery when bot is lost"""
-       logger.warning("Bot is lost, attempting recovery")
-       
-       # Recovery strategies based on performance mode
-       if self.config.performance_mode == "fast":
-           # Quick recovery - just tap center and continue
-           self.device.tap_xy(360, 640)
+           # Try multiple methods to close ad
+           logger.info("✅ Ad finished, claiming reward...")
            time.sleep(1)
-       else:
-           # Comprehensive recovery
-           recovery_strategies = [
-               # Strategy 1: Try common UI locations
-               lambda: self._try_common_buttons(),
-               
-               # Strategy 2: Check if we're in a dialog
-               lambda: self._check_dialogs(),
-               
-               # Strategy 3: Try going back
-               lambda: self.device.back(),
-               lambda: time.sleep(2),
-               
-               # Strategy 4: Verify app is running
-               lambda: self.ensure_app_running(),
-               
-               # Strategy 5: Force restart if nothing works
-               lambda: self._force_restart_app() if self.stats['unknown_states'] > 20 else None,
+           
+           # Take new screenshot for close button
+           capture = self.device.capture()
+           if capture:
+               # Try to find specific close buttons
+               for button_name in ['claim', 'close', 'x_button']:
+                   close_button = find_button(capture, button_name)
+                   if close_button:
+                       self.device.tap_point(close_button)
+                       time.sleep(0.5)
+           
+           # Fallback: tap common close positions
+           close_positions = [
+               (360, 800),   # Center claim
+               (650, 100),   # Top-right X
+               (360, 1100),  # Bottom close
+               (50, 50),     # Top-left back
            ]
            
-           for strategy in recovery_strategies:
-               try:
-                   result = strategy()
-                   if result:  # Some strategies return True if successful
-                       break
-               except Exception as e:
-                   logger.error(f"Recovery strategy failed: {e}")
-       
-       self.stats['unknown_states'] = 0
-   
-   def _try_common_buttons(self) -> bool:
-       """Try to find and click common buttons"""
-       capture = self.device.capture()
-       if capture is None:
-           return False
+           for pos in close_positions:
+               self.device.tap_point(pos)
+               time.sleep(0.3)
            
-       # Try to find common buttons
-       for button_name in ['close', 'ok', 'continue', 'retry', 'back']:
-           button_pos = find_button(capture, button_name)
-           if button_pos:
-               logger.info(f"Found {button_name} button")
-               self.device.tap_point(button_pos)
-               time.sleep(1)
+           # Verify gem increase
+           time.sleep(2)
+           capture = self.device.capture()
+           if capture:
+               values = extract_game_values(capture)
+               gems_after = values.get('gems', gems_before)
+               self.gem_stats.update_gems(gems_after)
+               
+               if gems_after > gems_before:
+                   gem_gain = gems_after - gems_before
+                   self.gem_stats.ads_watched += 1
+                   self.last_ad_success = time.time()
+                   self.ad_retry_count = 0
+                   logger.info(f"💎 SUCCESS! Gained {gem_gain} gems! Total: {gems_after}")
+                   
+                   # Update game state
+                   self.state_manager.game_state.track_gem_collection(gem_gain, "ad")
+                   
+                   return True
+               else:
+                   logger.warning("⚠️ Could not verify gem increase")
+                   self.gem_stats.ad_failures += 1
+           
+       except Exception as e:
+           logger.error(f"Ad gem check failed: {e}")
+           self.gem_stats.ad_failures += 1
+       
+       return False
+   
+   def check_spinning_gem(self) -> bool:
+       """Priority 2: Check for spinning gem during waves"""
+       if not self.in_wave:
+           return False
+       
+       try:
+           # Take screenshot
+           capture = self.device.capture()
+           if capture is None:
+               return False
+           
+           # Detect spinning gem
+           gem_position = detect_spinning_gem(capture)
+           
+           if gem_position:
+               logger.info(f"🔹 Found spinning gem at {gem_position}!")
+               
+               # Tap with randomization
+               if self.config.randomize_taps:
+                   tap_x = gem_position[0] + np.random.randint(-5, 5)
+                   tap_y = gem_position[1] + np.random.randint(-5, 5)
+               else:
+                   tap_x, tap_y = gem_position
+               
+               self.device.tap_xy(tap_x, tap_y)
+               
+               # Track collection
+               self.gem_stats.spinning_gems_collected += 1
+               self.gem_stats.update_gems(self.gem_stats.gems_current + 2)
+               self.state_manager.game_state.track_gem_collection(2, "spinning")
+               
                return True
                
+       except Exception as e:
+           logger.error(f"Spinning gem check failed: {e}")
+       
        return False
    
-   def _check_dialogs(self) -> bool:
-       """Check for and handle common dialogs"""
-       # Common dialog close button locations
-       dialog_close_positions = [
-           (650, 200),  # Top right
-           (360, 1000), # Bottom center
-           (600, 400),  # Middle right
-       ]
-       
-       for pos in dialog_close_positions:
-           self.device.tap_point(pos)
-           time.sleep(0.5)
+   def run_main_cycle(self):
+       """Execute main automation cycle"""
+       try:
+           # Take screenshot
+           capture = self.device.capture()
+           if capture is None:
+               logger.error("Capture failed")
+               return
            
-       return False
-   
-   def _force_restart_app(self):
-       """Force restart the app as last resort"""
-       logger.warning("Force restarting app")
-       self.device.force_stop_app(self.config.app_package)
-       time.sleep(2)
-       self.device.launch_app(self.config.app_package)
-       time.sleep(5)
-   
-   def print_stats(self):
-       """Display comprehensive automation statistics"""
-       runtime = time.time() - self.stats['start_time']
-       runtime_hours = runtime / 3600
-       
-       logger.info("\n" + "="*50)
-       logger.info("AUTOMATION STATISTICS")
-       logger.info("="*50)
-       
-       # Basic stats
-       logger.info(f"Runtime: {runtime_hours:.2f} hours ({runtime:.0f} seconds)")
-       logger.info(f"Total cycles: {self.stats['cycles']}")
-       logger.info(f"Actions performed: {self.stats['actions_performed']}")
-       logger.info(f"Errors: {self.stats['errors']}")
-       logger.info(f"Capture failures: {self.stats['captures_failed']}")
-       
-       # Performance stats
-       perf_stats = self.performance.get_stats()
-       if perf_stats:
-           logger.info("\nPERFORMANCE METRICS:")
-           logger.info(f"Avg cycle time: {perf_stats.get('avg_cycle_time', 0):.2f}s")
-           logger.info(f"Avg capture time: {perf_stats.get('avg_capture_time', 0):.3f}s")
-           logger.info(f"Avg process time: {perf_stats.get('avg_process_time', 0):.3f}s")
-           logger.info(f"Avg confidence: {perf_stats.get('avg_confidence', 0):.2%}")
+           # Extract and update game values
+           if self.config.enable_ocr:
+               values = extract_game_values(capture)
+               if values:
+                   # Update gem count
+                   if 'gems' in values:
+                       self.gem_stats.update_gems(values['gems'])
+                   
+                   # Update game state
+                   game_state = self.state_manager.game_state
+                   game_state.gems = values.get('gems', game_state.gems)
+                   game_state.gold = values.get('gold', game_state.gold)
+                   game_state.wave_number = values.get('wave', game_state.wave_number)
            
-           if 'avg_memory_mb' in perf_stats:
-               logger.info(f"Avg memory usage: {perf_stats['avg_memory_mb']:.1f} MB")
-       
-       # Game stats
-       game_state = self.state_manager.game_state
-       logger.info("\nGAME STATISTICS:")
-       logger.info(f"Total runs: {game_state.total_runs}")
-       logger.info(f"Best wave: {game_state.best_wave}")
-       logger.info(f"Current wave: {game_state.wave_number}")
-       
-       if game_state.upgrade_counts:
-           logger.info("\nUPGRADE DISTRIBUTION:")
-           total_upgrades = sum(game_state.upgrade_counts.values())
-           for upgrade, count in sorted(game_state.upgrade_counts.items(), 
-                                      key=lambda x: x[1], reverse=True):
-               percentage = (count / total_upgrades) * 100
-               logger.info(f"  {upgrade}: {count} ({percentage:.1f}%)")
-       
-       # Performance suggestions
-       suggestions = self.performance.suggest_optimizations()
-       if suggestions:
-           logger.info("\nPERFORMANCE SUGGESTIONS:")
-           for suggestion in suggestions:
-               logger.info(f"  • {suggestion}")
-       
-       logger.info("="*50 + "\n")
+           # Detect and execute current state
+           current_state = self.state_manager.detect_state(capture)
+           
+           if current_state:
+               logger.info(f"📍 State: {current_state.name}")
+               
+               # Update wave status
+               self.in_wave = current_state.name in ['PlayAttackState', 'PlayDefenseState', 'PlayUtilityState']
+               
+               # Execute state strategy
+               self.state_manager.execute_current_state(self.device, capture)
+           else:
+               logger.warning("Unknown state")
+               
+               # Try to recover
+               if self.state_manager.unknown_state_count > 5:
+                   logger.warning("Lost for too long, attempting recovery")
+                   self.device.tap_xy(360, 640)  # Tap center
+                   time.sleep(1)
+                   self.device.back()  # Try back button
+                   
+       except Exception as e:
+           logger.error(f"Main cycle error: {e}")
    
    def run(self):
-       """Main automation loop with hot-reload and monitoring"""
-       logger.info("Starting Tower Defense Bot Automation")
-       logger.info(f"Performance mode: {self.config.performance_mode}")
-       logger.info(f"Device: {self.config.device_id}")
+       """Main gem farming loop"""
+       logger.info("🎮 Starting Tower Defense Gem Farming Bot")
+       logger.info(f"⚙️ Main loop: {self.config.main_loop_interval}s")
+       logger.info(f"⚙️ Ad check: {self.config.ad_check_interval}s")
+       logger.info(f"⚙️ Spinning gem check: {self.config.spinning_gem_check_interval}s")
        
        if not self.connect_device():
            return
@@ -610,87 +402,163 @@ class TowerAutomation:
            logger.error("Failed to start app")
            return
        
+       # Get initial gem count
+       time.sleep(2)
+       capture = self.device.capture()
+       if capture:
+           values = extract_game_values(capture)
+           if 'gems' in values:
+               self.gem_stats.gems_start = values['gems']
+               self.gem_stats.gems_current = values['gems']
+               logger.info(f"💎 Starting gems: {self.gem_stats.gems_start}")
+       
        self.running = True
-       last_stats_print = time.time()
-       last_config_check = time.time()
-       consecutive_errors = 0
+       
+       # Start CLI interface in separate thread
+       cli_thread = threading.Thread(target=self.run_cli_interface, daemon=True)
+       cli_thread.start()
        
        try:
            while self.running:
-               try:
-                   # Run automation cycle
-                   self.run_cycle()
-                   consecutive_errors = 0
+               current_time = time.time()
+               
+               # Priority 1: Ad gem check (every 10 minutes)
+               if current_time - self.last_ad_check >= self.config.ad_check_interval:
+                   if not self.watching_ad:  # Don't check while watching ad
+                       self.check_ad_gem()
+                       self.last_ad_check = current_time
                    
-                   # Periodic tasks
-                   current_time = time.time()
-                   
-                   # Print stats every 5 minutes
-                   if current_time - last_stats_print > 300:
-                       self.print_stats()
-                       last_stats_print = current_time
-                   
-                   # Check for config changes every 30 seconds
-                   if current_time - last_config_check > 30:
-                       if self.config.check_reload():
-                           # Apply new settings
-                           self.timing.base_delay = self.config.base_delay
-                           logger.info("Applied new configuration")
-                       last_config_check = current_time
-                   
-               except Exception as e:
-                   logger.error(f"Cycle error: {e}")
-                   self.stats['errors'] += 1
-                   consecutive_errors += 1
-                   
-                   # Exponential backoff for consecutive errors
-                   wait_time = min(30, 2 ** consecutive_errors)
-                   logger.info(f"Waiting {wait_time}s before retry...")
-                   time.sleep(wait_time)
-                   
-                   # Reconnect if too many consecutive errors
-                   if consecutive_errors > 5:
-                       logger.warning("Too many consecutive errors, reconnecting")
-                       self.connect_device()
-                       self.ensure_app_running()
-                       consecutive_errors = 0
-                       
+                   # If ad failed, retry more frequently
+                   if self.ad_retry_count > 0 and current_time - self.last_ad_success > 900:
+                       # No ad success in 15 minutes, retry every 30 seconds
+                       self.config.ad_check_interval = 30
+                       self.ad_retry_count += 1
+                   else:
+                       # Reset to normal interval
+                       self.config.ad_check_interval = 600
+               
+               # Priority 2: Spinning gem check (every 15 seconds if in wave)
+               if self.in_wave and current_time - self.last_spinning_check >= self.config.spinning_gem_check_interval:
+                   self.check_spinning_gem()
+                   self.last_spinning_check = current_time
+               
+               # Regular automation cycle (every 60 seconds)
+               if current_time - self.last_main_loop >= self.config.main_loop_interval:
+                   self.run_main_cycle()
+                   self.last_main_loop = current_time
+               
+               # Sleep to prevent CPU waste
+               time.sleep(1)
+               
        except KeyboardInterrupt:
            logger.info("Automation interrupted by user")
        finally:
            self.cleanup()
    
+   def run_cli_interface(self):
+       """Simple command-line interface"""
+       print("\n" + "="*50)
+       print("💎 TOWER DEFENSE GEM FARMING BOT 💎")
+       print("="*50)
+       print("\nCommands:")
+       print("  stats  - Show current statistics")
+       print("  freq   - Change check frequency")
+       print("  stop   - Stop bot")
+       print("  help   - Show commands")
+       print("\n")
+       
+       while self.running:
+           try:
+               cmd = input("> ").strip().lower()
+               
+               if cmd == "stats":
+                   self.print_stats()
+               elif cmd == "freq":
+                   self.change_frequency()
+               elif cmd == "stop":
+                   self.stop()
+               elif cmd == "help":
+                   print("\nCommands: stats, freq, stop, help\n")
+               elif cmd:
+                   print("Unknown command. Type 'help' for commands.")
+                   
+           except EOFError:
+               # Handle Ctrl+D
+               break
+           except Exception:
+               # Ignore other errors in CLI
+               pass
+   
+   def print_stats(self):
+       """Display current statistics"""
+       stats = self.gem_stats.get_summary()
+       game_state = self.state_manager.game_state
+       
+       print("\n" + "="*50)
+       print("📊 GEM FARMING STATISTICS")
+       print("="*50)
+       
+       print(f"⏱️ Runtime: {stats['runtime_hours']:.2f} hours")
+       print(f"💎 Current Gems: {stats['current_gems']}")
+       print(f"📈 Gems Gained: {stats['total_gems_gained']}")
+       print(f"⚡ Gems/Hour: {stats['gems_per_hour']:.1f}")
+       print(f"📺 Ads Watched: {stats['ads_watched']}")
+       print(f"✅ Ad Success Rate: {stats['ad_success_rate']:.1f}%")
+       print(f"🔹 Spinning Gems: {stats['spinning_gems']}")
+       print(f"🌊 Current Wave: {game_state.wave_number}")
+       print(f"🏆 Best Wave: {game_state.best_wave}")
+       
+       # Next ad time
+       next_ad = self.config.ad_check_interval - (time.time() - self.last_ad_check)
+       if next_ad > 0:
+           print(f"⏰ Next Ad Check: {next_ad/60:.1f} minutes")
+       else:
+           print(f"⏰ Next Ad Check: Now!")
+       
+       print("="*50 + "\n")
+   
+   def change_frequency(self):
+       """Change check frequency"""
+       print(f"\nCurrent check frequency: {self.config.main_loop_interval} seconds")
+       print("Enter new frequency (30-120 seconds):")
+       
+       try:
+           new_freq = int(input("New frequency: "))
+           if 30 <= new_freq <= 120:
+               self.config.main_loop_interval = new_freq
+               print(f"✅ Check frequency set to {new_freq} seconds")
+           else:
+               print("❌ Frequency must be between 30-120 seconds")
+       except ValueError:
+           print("❌ Invalid number")
+   
    def cleanup(self):
        """Clean up resources and save state"""
        logger.info("Cleaning up...")
        
-       # Stop async capture
-       if self.async_capture:
-           self.async_capture.stop()
-       
-       # Save statistics
+       # Final statistics
        self.print_stats()
        
        # Save state manager config
        if self.config.state_config_path:
            self.state_manager.save_config(self.config.state_config_path)
-           logger.info(f"Saved state configuration to {self.config.state_config_path}")
+           logger.info(f"Saved state configuration")
        
        # Save automation config
        self.config.save_to_file()
-       logger.info(f"Saved automation config to {self.config.config_file}")
+       logger.info(f"Saved automation config")
        
        # Save final statistics
-       stats_path = self.config.screenshot_dir / f"stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+       stats_path = self.config.screenshot_dir / f"gem_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
        with open(stats_path, 'w') as f:
            json.dump({
-               'stats': self.stats,
-               'performance': self.performance.get_stats(),
+               'stats': self.gem_stats.get_summary(),
                'game_state': {
                    'total_runs': self.state_manager.game_state.total_runs,
                    'best_wave': self.state_manager.game_state.best_wave,
-                   'upgrade_counts': self.state_manager.game_state.upgrade_counts,
-               }
+                   'total_gems_collected': self.state_manager.game_state.gems_collected,
+               },
+               'timestamp': datetime.now().isoformat()
            }, f, indent=2)
        logger.info(f"Saved statistics to {stats_path}")
    
@@ -700,15 +568,14 @@ class TowerAutomation:
        logger.info("Stopping automation...")
 
 def main():
-   """Entry point with argument parsing"""
+   """Entry point"""
    import argparse
    
-   parser = argparse.ArgumentParser(description="Tower Defense Bot Automation")
+   parser = argparse.ArgumentParser(description="Tower Defense Gem Farming Bot")
    parser.add_argument('--config', type=str, default='config.json',
                       help='Path to configuration file')
    parser.add_argument('--device', type=str, help='Override device ID')
-   parser.add_argument('--performance', choices=['fast', 'balanced', 'quality'],
-                      help='Override performance mode')
+   parser.add_argument('--loop-interval', type=int, help='Main loop interval (30-120 seconds)')
    parser.add_argument('--debug', action='store_true',
                       help='Enable debug logging')
    
@@ -724,8 +591,12 @@ def main():
    # Apply command line overrides
    if args.device:
        config.device_id = args.device
-   if args.performance:
-       config.performance_mode = args.performance
+   if args.loop_interval:
+       if 30 <= args.loop_interval <= 120:
+           config.main_loop_interval = args.loop_interval
+       else:
+           print("Loop interval must be between 30-120 seconds")
+           sys.exit(1)
    
    # Create and run automation
    automation = TowerAutomation(config)

@@ -1,0 +1,14 @@
+{
+  "app_package": "com.techtreegames.thetower",
+  "main_loop_interval": 60,
+  "ad_check_interval": 600,
+  "spinning_gem_check_interval": 15,
+  "enable_ocr": true,
+  "gem_farming_mode": true,
+  "workshop_automation": true,
+  "lab_automation": true,
+  "event_automation": true,
+  "ultimate_weapon_sync": true,
+  "target_modules": ["PF", "GCOMP"],
+  "gem_spend_threshold": 18000
+}
