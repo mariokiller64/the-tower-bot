@@ -21,13 +21,14 @@ class DeviceConnection:
         self._initialize_adb()
     
     def _initialize_adb(self):
-        """Initialize ADB with cleanup"""
+        """Initialize ADB with fixed path"""
         try:
-            sp.run(['adb', 'kill-server'], stdout=sp.PIPE, stderr=sp.PIPE)
+            adb_path = str(Path(__file__).resolve().parent / 'platform-tools' / 'adb.exe')
+            sp.run([adb_path, 'kill-server'], stdout=sp.PIPE, stderr=sp.PIPE)
             time.sleep(1)
-            sp.run(['adb', 'start-server'], stdout=sp.PIPE, stderr=sp.PIPE)
+            sp.run([adb_path, 'start-server'], stdout=sp.PIPE, stderr=sp.PIPE)
             time.sleep(2)
-            self.client = AdbClient()
+            self.client = AdbClient(host="127.0.0.1", port=5037)
         except Exception as e:
             logger.error(f"ADB initialization failed: {e}")
             raise
