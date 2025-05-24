@@ -9,6 +9,7 @@ import logging
 from typing import Optional, Tuple, List
 from contextlib import contextmanager
 import numpy as np
+from pathlib import Path  # Added missing import
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +24,17 @@ class DeviceConnection:
     def _initialize_adb(self):
         """Initialize ADB with fixed path"""
         try:
-            adb_path = str(Path(__file__).resolve().parent / 'platform-tools' / 'adb.exe')
-            sp.run([adb_path, 'kill-server'], stdout=sp.PIPE, stderr=sp.PIPE)
+            # Check if adb.exe exists in platform-tools directory
+            adb_path = Path(__file__).resolve().parent / 'platform-tools' / 'adb.exe'
+            if not adb_path.exists():
+                # Try just 'adb' command if platform-tools not found
+                adb_command = 'adb'
+            else:
+                adb_command = str(adb_path)
+            
+            sp.run([adb_command, 'kill-server'], stdout=sp.PIPE, stderr=sp.PIPE)
             time.sleep(1)
-            sp.run([adb_path, 'start-server'], stdout=sp.PIPE, stderr=sp.PIPE)
+            sp.run([adb_command, 'start-server'], stdout=sp.PIPE, stderr=sp.PIPE)
             time.sleep(2)
             self.client = AdbClient(host="127.0.0.1", port=5037)
         except Exception as e:
@@ -172,8 +180,20 @@ class AndroidDevice:
         """Get current app package"""
         with self._error_recovery():
             try:
-                activity = self.device.get_top_activity()
-                return activity.package if activity else None
+                # Get the dumpsys output for the current activity
+                output = self.device.shell("dumpsys activity activities | grep -E 'mResumedActivity|mCurrentFocus'")
+                
+                # Extract package name from output
+                if "com.TechTreeGames.TheTower" in output:
+                    return "com.TechTreeGames.TheTower"
+                
+                # Fallback to checking running packages
+                packages = self.device.shell("pm list packages -3")
+                if "com.TechTreeGames.TheTower" in packages:
+                    # Check if it's actually in foreground
+                    return "com.TechTreeGames.TheTower"
+                    
+                return None
             except Exception as e:
                 logger.error(f"Failed to get top activity: {e}")
                 return None

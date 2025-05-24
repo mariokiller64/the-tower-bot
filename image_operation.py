@@ -5,8 +5,16 @@ from typing import Tuple, Optional, List, Dict
 from dataclasses import dataclass
 import logging
 from pathlib import Path
-import pytesseract
+import time  # Added missing import
 import re
+
+# Try to import pytesseract, but make it optional
+try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
+    logging.warning("pytesseract not available, OCR features disabled")
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +43,10 @@ class ImageMatcher:
             logger.warning("Templates directory created. Add button templates!")
             return
             
-        # Load button templates
+        # Load button templates - updated to match actual filenames
         button_names = [
-            "5_gem_ad", "claim", "close", "x_button",
+            "5GemAdButton", "ClaimButton", "FinishAdButton", "FinishAdButton2",
+            "IAgreeButton", "RewardGrantedButton", "close", "x_button",
             "spinning_gem", "start_wave", "retry",
             "workshop", "lab", "cards", "modules"
         ]
@@ -52,6 +61,16 @@ class ImageMatcher:
                         logger.debug(f"Loaded template: {name}")
                     break
         
+        # Also check state_images for button templates
+        state_images_dir = Path("state_images")
+        if state_images_dir.exists():
+            for image_file in state_images_dir.glob("*Button.png"):
+                name = image_file.stem
+                template = cv2.imread(str(image_file))
+                if template is not None:
+                    self.template_cache[name] = template
+                    logger.debug(f"Loaded state button template: {name}")
+    
     def template_match(self, image: np.ndarray, template: np.ndarray, 
                       threshold: float = 0.8) -> Optional[MatchResult]:
         """Multi-scale template matching"""
@@ -96,53 +115,16 @@ class ImageMatcher:
         
         return best_match
     
-    def feature_match(self, image: np.ndarray, reference: np.ndarray,
-                     min_matches: int = 10) -> Optional[MatchResult]:
-        """Feature-based matching using SIFT"""
-        try:
-            # Detect features
-            kp1, des1 = self.feature_detector.detectAndCompute(reference, None)
-            kp2, des2 = self.feature_detector.detectAndCompute(image, None)
-            
-            if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
-                return None
-            
-            # Match features
-            matches = self.matcher.knnMatch(des1, des2, k=2)
-            
-            # Apply ratio test
-            good_matches = []
-            for match_pair in matches:
-                if len(match_pair) == 2:
-                    m, n = match_pair
-                    if m.distance < 0.7 * n.distance:
-                        good_matches.append(m)
-            
-            if len(good_matches) >= min_matches:
-                # Calculate average position
-                points = np.float32([kp2[m.trainIdx].pt for m in good_matches])
-                center = np.mean(points, axis=0)
-                
-                return MatchResult(
-                    confidence=len(good_matches) / max(len(kp1), len(kp2)),
-                    location=tuple(center.astype(int)),
-                    method="feature"
-                )
-                
-        except Exception as e:
-            logger.error(f"Feature matching failed: {e}")
-            
-        return None
-    
     def detect_ad_button(self, screen: np.ndarray) -> Optional[Tuple[int, int]]:
         """Specialized detection for 5-gem ad button"""
         # Multiple detection strategies for ad button
         
         # Strategy 1: Template matching
-        if "5_gem_ad" in self.template_cache:
-            result = self.template_match(screen, self.template_cache["5_gem_ad"], threshold=0.7)
-            if result:
-                return result.location
+        for button_name in ["5GemAdButton", "5_gem_ad"]:
+            if button_name in self.template_cache:
+                result = self.template_match(screen, self.template_cache[button_name], threshold=0.7)
+                if result:
+                    return result.location
         
         # Strategy 2: Color-based detection for gem icon
         # Ad button typically has bright gem colors
@@ -186,6 +168,9 @@ class ImageMatcher:
     
     def _contains_five_text(self, region: np.ndarray) -> bool:
         """Check if region contains '5' text"""
+        if not TESSERACT_AVAILABLE:
+            return False
+            
         try:
             # Preprocess for OCR
             gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
@@ -210,9 +195,6 @@ class OCRProcessor:
     """Text recognition for game values"""
     
     def __init__(self):
-        # Configure pytesseract path if needed
-        # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-        
         # Precompile regex patterns
         self.number_pattern = re.compile(r'[\d,]+')
         self.wave_pattern = re.compile(r'Wave\s*(\d+)', re.IGNORECASE)
@@ -220,6 +202,9 @@ class OCRProcessor:
     def extract_number_from_region(self, region: np.ndarray, 
                                   preprocess: str = "thresh") -> Optional[int]:
         """Extract numeric value from region with preprocessing"""
+        if not TESSERACT_AVAILABLE:
+            return None
+            
         try:
             # Preprocessing
             gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
@@ -264,6 +249,9 @@ class OCRProcessor:
     
     def extract_text_from_region(self, region: np.ndarray) -> str:
         """Extract text from region"""
+        if not TESSERACT_AVAILABLE:
+            return ""
+            
         try:
             # Preprocess
             gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
@@ -284,7 +272,7 @@ ocr_processor = OCRProcessor()
 def find_button(screen: np.ndarray, button_name: str) -> Optional[Tuple[int, int]]:
     """Find a specific button on screen"""
     # Special handling for ad button
-    if button_name == "5_gem_ad":
+    if button_name in ["5_gem_ad", "5GemAdButton"]:
         return image_matcher.detect_ad_button(screen)
     
     # Check template cache
@@ -295,7 +283,7 @@ def find_button(screen: np.ndarray, button_name: str) -> Optional[Tuple[int, int
             return result.location
     
     # Fallback: try loading template directly
-    template_path = Path(f"templates/buttons/{button_name}.png")
+    template_path = Path(f"templates/{button_name}.png")
     if template_path.exists():
         template = cv2.imread(str(template_path))
         if template is not None:

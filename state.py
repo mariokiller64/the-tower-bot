@@ -537,18 +537,18 @@ class GameOverState(State):
         # Quick retry
         device.tap_point(self.get_action_point('retry'))
 
-# GEM FARMING STATES based on your images
+# GEM FARMING STATES - Updated to match actual filenames
 class AdGemState(State):
-    """Detects the 5_gem_ad button"""
+    """Detects the 5GemAdButton state"""
     def __init__(self):
         super().__init__(
-            name="5_gem_ad",  # Matches your image name
+            name="5GemAdButton",  # Updated to match actual image name
             regions=[
                 # The 5-gem ad button detection regions
-                Region(300, 960, 120, 120, weight=1.0, name="ad_button"),
+                Region(250, 900, 220, 150, weight=1.0, name="ad_button"),
             ],
             actions={
-                'tap_ad': (360, 1020),
+                'tap_ad': (360, 975),
             },
             config=StateConfig(min_confidence=0.70)  # Lower threshold for ad detection
         )
@@ -607,31 +607,13 @@ class FinishedAdState(State):
         # Track gem collection
         game_state.track_gem_collection(5, "ad")
 
-class EULAState(State):
-    """EULA agreement screen"""
+class ClaimState(State):
+    """State for claiming rewards"""
     def __init__(self):
         super().__init__(
-            name="EULASTATE",  # Matches your image
+            name="ClaimState",  # Matches your image
             regions=[
-                Region(200, 600, 320, 200, weight=1.0, name="eula_text"),
-            ],
-            actions={
-                'agree': (360, 900),  # iAgree button location
-            }
-        )
-    
-    def execute_strategy(self, device, capture, game_state):
-        """Accept EULA"""
-        logger.info("Accepting EULA...")
-        device.tap_point(self.get_action_point('agree'))
-
-class RewardState(State):
-    """General reward screen"""
-    def __init__(self):
-        super().__init__(
-            name="Reward",  # Matches your image
-            regions=[
-                Region(200, 400, 320, 400, weight=1.0, name="reward_content"),
+                Region(250, 750, 220, 100, weight=1.0, name="claim_button"),
             ],
             actions={
                 'claim': (360, 800),
@@ -645,6 +627,42 @@ class RewardState(State):
         device.tap_point(self.get_action_point('claim'))
         time.sleep(0.5)
         device.tap_point(self.get_action_point('close'))
+
+class EULAState(State):
+    """EULA agreement screen"""
+    def __init__(self):
+        super().__init__(
+            name="EULASTATE",  # Matches your image
+            regions=[
+                Region(200, 600, 320, 200, weight=1.0, name="eula_text"),
+            ],
+            actions={
+                'agree': (360, 900),  # IAgreeButton location
+            }
+        )
+    
+    def execute_strategy(self, device, capture, game_state):
+        """Accept EULA"""
+        logger.info("Accepting EULA...")
+        device.tap_point(self.get_action_point('agree'))
+
+class ActiveBonusTimer(State):
+    """State when bonus timer is active"""
+    def __init__(self):
+        super().__init__(
+            name="ActiveBonusTimer",  # Matches your image
+            regions=[
+                Region(250, 450, 220, 100, weight=1.0, name="timer_display"),
+            ],
+            actions={
+                'wait': (360, 640),
+            }
+        )
+    
+    def execute_strategy(self, device, capture, game_state):
+        """Just wait or continue playing"""
+        logger.debug("Bonus timer active")
+        # Continue playing normally
 
 class SpinningGemDetector:
     """Specialized detector for moving 2-gem diamond"""
@@ -753,7 +771,7 @@ class StateManager:
         self.state_transition_matrix = {}
         self.spinning_gem_detector = SpinningGemDetector()
         self.last_ad_check = 0
-        self.ad_check_interval = 600  # 10 minutes
+        self.ad_check_interval = 300  # 5 minutes
         
         if config_path and config_path.exists():
             self.load_config(config_path)
@@ -766,11 +784,12 @@ class StateManager:
             PlayDefenseState(),
             PlayUtilityState(),
             GameOverState(),
-            AdGemState(),          # 5_gem_ad
+            AdGemState(),          # 5GemAdButton
             WatchingAdState(),     # WatchingAdState
             FinishedAdState(),     # FinishedAdState
+            ClaimState(),          # ClaimState
             EULAState(),          # EULASTATE
-            RewardState(),        # Reward
+            ActiveBonusTimer(),   # ActiveBonusTimer
         ]
     
     def detect_state(self, capture: np.ndarray) -> Optional[State]:
