@@ -1,4 +1,4 @@
-# state.py - Updated with gem farming states and detection
+# state.py - Updated with actual game states from your images
 from abc import ABC, abstractmethod
 from PIL import Image
 import numpy as np
@@ -39,7 +39,7 @@ class Region:
 
 @dataclass
 class StateConfig:
-    """Configuration for state detection with OpenCV 4.11 optimizations"""
+    """Configuration for state detection"""
     min_confidence: float = 0.85
     histogram_bins: int = 16
     color_weight: float = 0.6
@@ -77,7 +77,7 @@ class State(ABC):
         self.reference_features = {}
         self.feature_cache = FeatureCache() if config and config.cache_features else None
         
-        # Initialize detectors with OpenCV 4.11 optimizations
+        # Initialize detectors
         self.sift = cv2.SIFT_create(nfeatures=500, contrastThreshold=0.04)
         self.orb = cv2.ORB_create(nfeatures=500, scaleFactor=1.2)
         
@@ -85,7 +85,7 @@ class State(ABC):
         self.load_reference_image()
         
     def load_reference_image(self):
-        """Load and preprocess reference image with caching"""
+        """Load and preprocess reference image"""
         image_path = Path(f'state_images/{self.name}.png')
         if not image_path.exists():
             logger.warning(f"No reference image found for {self.name}")
@@ -358,7 +358,7 @@ class GameState:
         
         logger.info(f"💎 Collected {amount} gems from {source}! Total: {self.gems}")
 
-# Concrete State Implementations
+# Concrete State Implementations based on your actual state images
 class MenuState(State):
     def __init__(self):
         super().__init__(
@@ -537,83 +537,40 @@ class GameOverState(State):
         # Quick retry
         device.tap_point(self.get_action_point('retry'))
 
-# NEW GEM FARMING STATES
+# GEM FARMING STATES based on your images
 class AdGemState(State):
-    """Handles 5-gem ad button detection and claiming"""
+    """Detects the 5_gem_ad button"""
     def __init__(self):
         super().__init__(
-            name="AdGemState",
+            name="5_gem_ad",  # Matches your image name
             regions=[
-                # Ad button typically appears around 80% screen height, centered
-                Region(300, 960, 120, 120, weight=1.0, name="ad_gem_button"),
-                Region(320, 980, 80, 80, weight=0.8, name="gem_number"),  # "5" text
-                Region(340, 1000, 40, 40, weight=0.6, name="video_icon"),
+                # The 5-gem ad button detection regions
+                Region(300, 960, 120, 120, weight=1.0, name="ad_button"),
             ],
             actions={
-                'tap_ad': (360, 1020),  # Center of ad button
-                'claim': (360, 800),    # Typical claim button location
-                'close': (650, 200),    # X button top-right
-                'close_alt': (360, 1100),  # Alternative close location
+                'tap_ad': (360, 1020),
             },
-            config=StateConfig(min_confidence=0.75)  # Lower threshold for ad detection
+            config=StateConfig(min_confidence=0.70)  # Lower threshold for ad detection
         )
         self.last_ad_time = 0
         self.ad_cooldown = 720  # 12 minutes
     
     def execute_strategy(self, device, capture, game_state):
-        """Claim 5-gem ad reward"""
-        logger.info("📺 Found 5-gem ad button! Claiming...")
-        
-        # Store current gems for verification
-        from image_operation import extract_game_values
-        values = extract_game_values(capture)
-        gems_before = values.get('gems', game_state.gems)
-        
-        # Tap ad button
+        """Tap the ad button to start watching"""
+        logger.info("📺 Found 5-gem ad button! Tapping...")
         device.tap_point(self.get_action_point('tap_ad'))
-        
-        # Wait for ad to play (60 seconds as specified)
-        logger.info("⏳ Watching ad for 60 seconds...")
-        for i in range(60):
-            time.sleep(1)
-            if i % 10 == 0:
-                logger.info(f"   {60-i} seconds remaining...")
-        
-        # Look for claim/close button
-        logger.info("✅ Ad finished, looking for claim button...")
-        time.sleep(1)
-        
-        # Try multiple close button locations
-        for action in ['claim', 'close', 'close_alt']:
-            device.tap_point(self.get_action_point(action))
-            time.sleep(0.5)
-        
-        # Verify gem increase
-        time.sleep(2)
-        new_capture = device.capture()
-        new_values = extract_game_values(new_capture)
-        gems_after = new_values.get('gems', game_state.gems)
-        
-        if gems_after > gems_before:
-            game_state.track_gem_collection(gems_after - gems_before, "ad")
-            logger.info(f"💎 SUCCESS! Gems: {gems_before} → {gems_after} (+{gems_after - gems_before})")
-        else:
-            logger.warning("⚠️ Could not verify gem increase")
-        
         self.last_ad_time = time.time()
 
 class WatchingAdState(State):
     """State while watching an ad"""
     def __init__(self):
         super().__init__(
-            name="WatchingAdState",
+            name="WatchingAdState",  # Matches your image
             regions=[
-                # Ad playing indicators
-                Region(0, 0, 720, 1280, weight=1.0, name="full_screen_ad"),
-                Region(650, 50, 50, 50, weight=0.8, name="skip_button"),
+                Region(0, 0, 720, 1280, weight=1.0, name="full_screen"),
             ],
             actions={
-                'wait': (360, 640),  # Just wait
+                'wait': (360, 640),
             }
         )
     
@@ -621,6 +578,73 @@ class WatchingAdState(State):
         """Just wait for ad to finish"""
         logger.debug("Watching ad...")
         time.sleep(1)  # Don't do anything while ad plays
+
+class FinishedAdState(State):
+    """State after ad finishes, need to claim reward"""
+    def __init__(self):
+        super().__init__(
+            name="FinishedAdState",  # Matches your image
+            regions=[
+                Region(250, 750, 220, 100, weight=1.0, name="claim_area"),
+            ],
+            actions={
+                'claim': (360, 800),
+                'close': (650, 100),
+            }
+        )
+    
+    def execute_strategy(self, device, capture, game_state):
+        """Claim the gem reward"""
+        logger.info("✅ Ad finished! Claiming reward...")
+        
+        # Try claim button first
+        device.tap_point(self.get_action_point('claim'))
+        time.sleep(1)
+        
+        # Then try close button
+        device.tap_point(self.get_action_point('close'))
+        
+        # Track gem collection
+        game_state.track_gem_collection(5, "ad")
+
+class EULAState(State):
+    """EULA agreement screen"""
+    def __init__(self):
+        super().__init__(
+            name="EULASTATE",  # Matches your image
+            regions=[
+                Region(200, 600, 320, 200, weight=1.0, name="eula_text"),
+            ],
+            actions={
+                'agree': (360, 900),  # iAgree button location
+            }
+        )
+    
+    def execute_strategy(self, device, capture, game_state):
+        """Accept EULA"""
+        logger.info("Accepting EULA...")
+        device.tap_point(self.get_action_point('agree'))
+
+class RewardState(State):
+    """General reward screen"""
+    def __init__(self):
+        super().__init__(
+            name="Reward",  # Matches your image
+            regions=[
+                Region(200, 400, 320, 400, weight=1.0, name="reward_content"),
+            ],
+            actions={
+                'claim': (360, 800),
+                'close': (650, 100),
+            }
+        )
+    
+    def execute_strategy(self, device, capture, game_state):
+        """Claim any reward"""
+        logger.info("Claiming reward...")
+        device.tap_point(self.get_action_point('claim'))
+        time.sleep(0.5)
+        device.tap_point(self.get_action_point('close'))
 
 class SpinningGemDetector:
     """Specialized detector for moving 2-gem diamond"""
@@ -735,24 +759,27 @@ class StateManager:
             self.load_config(config_path)
     
     def _initialize_states(self) -> List[State]:
-        """Initialize all game states including gem states"""
+        """Initialize all game states based on your actual images"""
         return [
             MenuState(),
             PlayAttackState(),
             PlayDefenseState(),
             PlayUtilityState(),
             GameOverState(),
-            AdGemState(),
-            WatchingAdState(),
+            AdGemState(),          # 5_gem_ad
+            WatchingAdState(),     # WatchingAdState
+            FinishedAdState(),     # FinishedAdState
+            EULAState(),          # EULASTATE
+            RewardState(),        # Reward
         ]
     
     def detect_state(self, capture: np.ndarray) -> Optional[State]:
-        """Detect current state with confidence scoring and prediction"""
+        """Detect current state with confidence scoring"""
         # Convert PIL to numpy if needed
         if isinstance(capture, Image.Image):
             capture = np.array(capture)
         
-        # Priority check for ad gem button (highest value)
+        # Priority check for ad gem button
         current_time = time.time()
         if current_time - self.last_ad_check >= self.ad_check_interval:
             ad_state = next((s for s in self.states if isinstance(s, AdGemState)), None)
@@ -784,7 +811,7 @@ class StateManager:
         if len(self.confidence_history) > 100:
             self.confidence_history.pop(0)
         
-        # Make decision based on confidence and history
+        # Make decision based on confidence
         if best_confidence >= best_state.config.min_confidence:
             self.unknown_state_count = 0
             self._track_transition(best_state)
